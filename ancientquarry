@@ -1,11 +1,12 @@
 --[[
-    Ancient Quarry Miner v1
+    Ancient Quarry Miner v2
     - Quarry path: workspace.RogueIslands.AncientQuarry.Quarry
     - Remote:      ReplicatedStorage.Remotes.MineStartQuarry
     - Call:        remote:InvokeServer(quarry, x, y, z, Vector3.new(0, 1, 0))
     - Reset detection via PlayerGui.QuarryTimerGui.QuarryTimer.Countdown
-    - Reset teleport target: 6000, 403, -60000 (can be overridden
-      via _G.__AncientQuarryResetPos or shared.__AncientQuarryResetPos)
+    - Reset teleport target: 3560.037, 4911.869, 1.613
+      (can also be overridden via _G.__AncientQuarryResetPos,
+      getgenv().__AncientQuarryResetPos, or shared.__AncientQuarryResetPos)
     - Modes: full / single_layer / vertical
 --]]
 
@@ -32,13 +33,10 @@ local UI_PARENT = getUIParent()
 -- ============================================================
 -- CONFIG
 -- ============================================================
-local CONFIG_FILE = "ancient_quarry_miner_v1.cfg"
+local CONFIG_FILE = "ancient_quarry_miner_v2.cfg"
 
--- Resolve the reset teleport target. Priority:
---   1. _G.__AncientQuarryResetPos (set by the loader)
---   2. shared.__AncientQuarryResetPos
---   3. getgenv().__AncientQuarryResetPos (if the executor provides it)
---   4. default 6000, 403, -60000
+local DEFAULT_RESET_POS = Vector3.new(3560.037, 4911.869, 1.613)
+
 local function resolveResetPos()
     local candidates = {}
 
@@ -61,7 +59,7 @@ local function resolveResetPos()
         end
     end
 
-    return Vector3.new(6000, 403, -60000)
+    return DEFAULT_RESET_POS
 end
 
 local config = {
@@ -81,13 +79,11 @@ local config = {
 
     ResetDetectionEnabled = true,
     ResetPause = 2.25,
-    ResetTeleportLift = 4.0,
+    ResetTeleportLift = 0,
     ResetTeleportRetries = 4,
     ResetTeleportRetryDelay = 0.35,
     TeleportOnGameReset = true,
     ResetTeleportPosition = resolveResetPos(),
-
-    TimerMissingStatus = true,
 }
 
 local function serialize(v)
@@ -145,7 +141,7 @@ end
 
 loadConfig()
 
--- The loader's override always wins over the saved config.
+-- The loader / default always wins over the saved config. Persist it.
 do
     local override = resolveResetPos()
     if typeof(override) == "Vector3" then
@@ -164,12 +160,12 @@ config.MinZ = math.floor(tonumber(config.MinZ) or 0)
 config.MaxZ = math.floor(tonumber(config.MaxZ) or 32)
 config.VerticalX = math.floor(tonumber(config.VerticalX) or 1)
 config.ResetPause = math.clamp(tonumber(config.ResetPause) or 2.25, 0.25, 10)
-config.ResetTeleportLift = math.clamp(tonumber(config.ResetTeleportLift) or 4, 0, 20)
+config.ResetTeleportLift = math.clamp(tonumber(config.ResetTeleportLift) or 0, 0, 20)
 config.ResetTeleportRetries = math.clamp(math.floor(tonumber(config.ResetTeleportRetries) or 4), 1, 8)
 config.ResetTeleportRetryDelay = math.clamp(tonumber(config.ResetTeleportRetryDelay) or 0.35, 0.1, 2)
 
 if typeof(config.ResetTeleportPosition) ~= "Vector3" then
-    config.ResetTeleportPosition = Vector3.new(6000, 403, -60000)
+    config.ResetTeleportPosition = DEFAULT_RESET_POS
 end
 
 if config.Mode ~= "full" and config.Mode ~= "single_layer" and config.Mode ~= "vertical" then
@@ -183,6 +179,8 @@ config.MaxY = math.clamp(config.MaxY, config.MinY, 681)
 config.MinZ = math.clamp(config.MinZ, 0, 32)
 config.MaxZ = math.clamp(config.MaxZ, config.MinZ, 32)
 config.VerticalX = math.clamp(config.VerticalX, config.MinX, config.MaxX)
+
+saveConfig()
 
 -- ============================================================
 -- STATE
@@ -296,7 +294,7 @@ local function teleportToResetPoint()
 end
 
 -- ============================================================
--- GAME OBJECT LOOKUP (ANCIENT QUARRY)
+-- GAME OBJECT LOOKUP
 -- ============================================================
 local function findQuarry()
     local rogueIslands = workspace:FindFirstChild("RogueIslands")
@@ -969,7 +967,8 @@ local function makeUI()
         elseif config.MineInterval < 0.5 then
             config.MineInterval = 0.5
         elseif config.MineInterval < 1 then
-            config.MineInterval = 1        else
+            config.MineInterval = 1
+        else
             config.MineInterval = 0
         end
         saveConfig()
