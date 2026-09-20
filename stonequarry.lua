@@ -57,8 +57,11 @@ local config = {
     Mode = "vertical", -- full / single_layer / vertical
 
     -- Mining speed. Keep this above 0 to avoid overlapping requests.
-    MineInterval = 0.09,
+    MineInterval = 0.0,
     BatchSize = 1,
+    SkipBlocks = 0, -- extra coordinates to skip after each successful mine (e.g. 2 for a 3x1 vein)
+    YieldEvery = 25,
+    ErrorRetryDelay = 0.05,
 
     MinX = 0,
     MaxX = 32,
@@ -169,8 +172,9 @@ end
 loadConfig()
 
 -- Clamp settings loaded from an old/bad config.
-config.MineInterval = math.clamp(tonumber(config.MineInterval) or 0.09, 0.03, 2)
+config.MineInterval = math.clamp(tonumber(config.MineInterval) or 0.0, 0, 2)
 config.BatchSize = math.clamp(math.floor(tonumber(config.BatchSize) or 1), 1, 5)
+config.SkipBlocks = math.clamp(math.floor(tonumber(config.SkipBlocks) or 0), 0, 32)
 config.MinX = math.floor(tonumber(config.MinX) or 0)
 config.MaxX = math.floor(tonumber(config.MaxX) or 32)
 config.MinY = math.floor(tonumber(config.MinY) or 0)
@@ -623,45 +627,49 @@ end)
 -- ============================================================
 -- CURSOR ADVANCEMENT
 -- ============================================================
-local function advanceCursor()
-    if config.Mode == "vertical" then
-        state.z += 1
-        if state.z > config.MaxZ then
-            state.z = config.MinZ
-            state.y -= 1
-        end
+local function advanceCursor(steps)
+    steps = math.max(1, math.floor(tonumber(steps) or 1))
 
-        if state.y < config.MinY then
-            -- Completing a full vertical column does NOT pretend the game reset.
-            -- We simply restart the configured column and continue.
-            state.x = config.VerticalX
-            state.y = config.MaxY
-            state.z = config.MinZ
-            setStatus("Vertical sweep completed -> restarted column")
-        end
+    for _ = 1, steps do
+        if config.Mode == "vertical" then
+            state.z += 1
+            if state.z > config.MaxZ then
+                state.z = config.MinZ
+                state.y -= 1
+            end
 
-        return
-    end
-
-    state.z += 1
-    if state.z > config.MaxZ then
-        state.z = config.MinZ
-        state.x += 1
-    end
-
-    if state.x > config.MaxX then
-        state.x = config.MinX
-
-        if config.Mode == "single_layer" then
-            state.y = config.MaxY
-            setStatus("Layer completed -> restarted top layer")
-        else
-            state.y -= 1
             if state.y < config.MinY then
+                state.x = config.VerticalX
                 state.y = config.MaxY
-                setStatus("Full sweep completed -> restarted top layer")
+                state.z = config.MinZ
+                setStatus("Vertical sweep completed -> restarted column")
+            end
+        else
+            state.z += 1
+            if state.z > config.MaxZ then
+                state.z = config.MinZ
+                state.x += 1
+            end
+
+            if state.x > config.MaxX then
+                state.x = config.MinX
+
+                if config.Mode == "single_layer" then
+                    state.y = config.MaxY
+                    setStatus("Layer completed -> restarted top layer")
+                else
+                    state.y -= 1
+                    if state.y < config.MinY then
+                        state.y = config.MaxY
+                        setStatus("Full sweep completed -> restarted top layer")
+                    end
+                end
             end
         end
+    end
+
+    if steps > 1 then
+        state.skipCount += (steps - 1)
     end
 end
 
@@ -740,7 +748,9 @@ local function mineOne()
         state.lastError = "-"
 
         -- Only advance after the request itself was accepted locally.
-        advanceCursor()
+        -- SkipBlocks is useful when a successful request breaks a small vein
+        -- (for example 3x1), leaving the following coordinates empty.
+        advanceCursor(1 + config.SkipBlocks)
         return true
     end
 
@@ -763,23 +773,41 @@ end
 -- ============================================================
 -- MINER WORKER
 -- ============================================================
+-- Fast path: successful RemoteFunction calls already yield until the server
+-- answers, so an additional fixed delay only adds client-side latency.
+-- We therefore continue immediately after a successful request and only yield
+-- periodically to keep the client responsive. Failed requests use a short
+-- retry delay instead of hammering a known-bad reference.
 local workerRunning = true
+local requestsSinceYield = 0
 
 task.spawn(function()
     while workerRunning do
-        if config.Enabled then
-            local batch = math.max(1, math.floor(config.BatchSize or 1))
-            for _ = 1, batch do
-                if not config.Enabled or now() < state.pausedUntil then
-                    break
-                end
-                pcall(mineOne)
-            end
-        else
+        if not config.Enabled then
             state.running = false
+            task.wait(0.10)
+            continue
         end
 
-        task.wait(config.MineInterval)
+        if now() < state.pausedUntil then
+            task.wait(math.min(0.05, math.max(0.001, state.pausedUntil - now())))
+            continue
+        end
+
+        local before = state.fireCount
+        local ok = pcall(mineOne)
+        local succeeded = ok and state.fireCount > before
+
+        if succeeded then
+            requestsSinceYield += 1
+            if requestsSinceYield >= math.max(1, math.floor(config.YieldEvery or 25)) then
+                requestsSinceYield = 0
+                task.wait()
+            end
+        else
+            requestsSinceYield = 0
+            task.wait(config.ErrorRetryDelay or 0.05)
+        end
     end
 end)
 
@@ -891,7 +919,7 @@ local function makeUI()
     title.Position = UDim2.new(0, 18, 0, 9)
     title.Size = UDim2.new(0, 230, 0, 22)
 
-    local subtitle = label(header, "Reset-aware sequential remote miner", 9, COLORS.muted)
+    local subtitle = label(header, "Reset-aware fast remote miner", 9, COLORS.muted)
     subtitle.Position = UDim2.new(0, 18, 0, 33)
     subtitle.Size = UDim2.new(0, 260, 0, 16)
 
@@ -987,6 +1015,9 @@ local function makeUI()
     local verticalXButton = button(content, "Vertical X: " .. tostring(config.VerticalX))
     verticalXButton.LayoutOrder = 22
 
+    local skipBlocksButton = button(content, "Skip blocks: " .. tostring(config.SkipBlocks))
+    skipBlocksButton.LayoutOrder = 23
+
     -- ---------- controls ----------
     local function refreshControls()
         toggleMining.Text = config.Enabled and "Mining: ON" or "Mining: OFF"
@@ -1005,6 +1036,7 @@ local function makeUI()
 
         intervalButton.Text = string.format("Mine interval: %.2fs", config.MineInterval)
         verticalXButton.Text = "Vertical X: " .. tostring(config.VerticalX)
+        skipBlocksButton.Text = "Skip blocks: " .. tostring(config.SkipBlocks)
     end
 
     toggleMining.MouseButton1Click:Connect(function()
@@ -1078,6 +1110,13 @@ local function makeUI()
         config.VerticalX = nextX
         saveConfig()
         resetCursor("vertical X changed")
+        refreshControls()
+    end)
+
+    skipBlocksButton.MouseButton1Click:Connect(function()
+        -- Cycle 0..10. For a 3x1 vein, use 2.
+        config.SkipBlocks = (config.SkipBlocks + 1) % 11
+        saveConfig()
         refreshControls()
     end)
 
