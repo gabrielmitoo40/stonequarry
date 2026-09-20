@@ -1,0 +1,1141 @@
+--[[
+    Quarry Miner v4 - reset-state rewrite
+
+    Known game paths from the supplied script:
+      workspace.RogueIslands.StoneQuarry.Quarry
+      game:GetService("ReplicatedStorage").Remotes.MineStartQuarry
+      Players.LocalPlayer.PlayerGui.QuarryTimerGui.QuarryTimer.Countdown
+
+    The miner intentionally does NOT use a client-side block-name occupancy map.
+    The server remote is treated as the source of truth for whether a coordinate
+    can be mined.
+
+    Automatic reset behavior is driven by the QuarryTimerGui countdown. The old
+    fixed 602-second timer and periodic vertical teleport timer are removed.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+if not player then
+    return
+end
+
+-- ============================================================
+-- UI PARENT
+-- ============================================================
+local function getUIParent()
+    if typeof(gethui) == "function" then
+        local ok, hui = pcall(gethui)
+        if ok and hui then
+            return hui
+        end
+    end
+
+    local ok, coreGui = pcall(function()
+        return game:GetService("CoreGui")
+    end)
+    if ok and coreGui then
+        return coreGui
+    end
+
+    return player:WaitForChild("PlayerGui")
+end
+
+local UI_PARENT = getUIParent()
+
+-- ============================================================
+-- CONFIG
+-- ============================================================
+local CONFIG_FILE = "quarry_miner_v4.cfg"
+
+local config = {
+    Enabled = true,
+    Mode = "vertical", -- full / single_layer / vertical
+
+    -- Mining speed. Keep this above 0 to avoid overlapping requests.
+    MineInterval = 0.09,
+    BatchSize = 1,
+
+    MinX = 0,
+    MaxX = 32,
+    MinY = 0,
+    MaxY = 681,
+    MinZ = 0,
+    MaxZ = 32,
+
+    VerticalX = 1,
+
+    -- Reset is tied to the game's own countdown.
+    ResetDetectionEnabled = true,
+    ResetPause = 2.25,
+    ResetTeleportLift = 4.0,
+    ResetTeleportRetries = 4,
+    ResetTeleportRetryDelay = 0.35,
+    TeleportOnGameReset = true,
+    ResetTeleportPosition = Vector3.new(2975.774, 4911.077, -4.618),
+
+    -- Optional safety timeout for a completely missing timer UI.
+    TimerMissingStatus = true,
+}
+
+local function serialize(v)
+    local t = typeof(v)
+    if t == "boolean" then
+        return "b:" .. tostring(v)
+    elseif t == "number" then
+        return "n:" .. tostring(v)
+    elseif t == "string" then
+        return "s:" .. tostring(v)
+    elseif t == "Vector3" then
+        return string.format("v:%g,%g,%g", v.X, v.Y, v.Z)
+    end
+    return nil
+end
+
+local function deserialize(s)
+    if type(s) ~= "string" or #s < 3 then
+        return nil
+    end
+
+    local prefix = s:sub(1, 2)
+    local body = s:sub(3)
+
+    if prefix == "b:" then
+        return body == "true"
+    elseif prefix == "n:" then
+        return tonumber(body)
+    elseif prefix == "s:" then
+        return body
+    elseif prefix == "v:" then
+        local x, y, z = body:match("^([^,]+),([^,]+),([^,]+)$")
+        x, y, z = tonumber(x), tonumber(y), tonumber(z)
+        if x and y and z then
+            return Vector3.new(x, y, z)
+        end
+    end
+
+    return nil
+end
+
+local function saveConfig()
+    if type(writefile) ~= "function" then
+        return false
+    end
+
+    local lines = {}
+    for key, value in pairs(config) do
+        local encoded = serialize(value)
+        if encoded then
+            lines[#lines + 1] = key .. "=" .. encoded
+        end
+    end
+
+    table.sort(lines)
+    return pcall(writefile, CONFIG_FILE, table.concat(lines, "\n"))
+end
+
+local function loadConfig()
+    if type(isfile) ~= "function" or type(readfile) ~= "function" then
+        return false
+    end
+
+    local okExists, exists = pcall(isfile, CONFIG_FILE)
+    if not okExists or not exists then
+        return false
+    end
+
+    local okRead, content = pcall(readfile, CONFIG_FILE)
+    if not okRead or type(content) ~= "string" then
+        return false
+    end
+
+    for line in content:gmatch("[^\r\n]+") do
+        local key, encoded = line:match("^([^=]+)=(.+)$")
+        if key and encoded and config[key] ~= nil then
+            local decoded = deserialize(encoded)
+            if decoded ~= nil and typeof(decoded) == typeof(config[key]) then
+                config[key] = decoded
+            end
+        end
+    end
+
+    return true
+end
+
+loadConfig()
+
+-- Clamp settings loaded from an old/bad config.
+config.MineInterval = math.clamp(tonumber(config.MineInterval) or 0.09, 0.03, 2)
+config.BatchSize = math.clamp(math.floor(tonumber(config.BatchSize) or 1), 1, 5)
+config.MinX = math.floor(tonumber(config.MinX) or 0)
+config.MaxX = math.floor(tonumber(config.MaxX) or 32)
+config.MinY = math.floor(tonumber(config.MinY) or 0)
+config.MaxY = math.floor(tonumber(config.MaxY) or 681)
+config.MinZ = math.floor(tonumber(config.MinZ) or 0)
+config.MaxZ = math.floor(tonumber(config.MaxZ) or 32)
+config.VerticalX = math.floor(tonumber(config.VerticalX) or 1)
+config.ResetPause = math.clamp(tonumber(config.ResetPause) or 2.25, 0.25, 10)
+config.ResetTeleportLift = math.clamp(tonumber(config.ResetTeleportLift) or 4, 0, 20)
+config.ResetTeleportRetries = math.clamp(math.floor(tonumber(config.ResetTeleportRetries) or 4), 1, 8)
+config.ResetTeleportRetryDelay = math.clamp(tonumber(config.ResetTeleportRetryDelay) or 0.35, 0.1, 2)
+config.ResetTeleportPosition = typeof(config.ResetTeleportPosition) == "Vector3"
+    and config.ResetTeleportPosition
+    or Vector3.new(2975.774, 4911.077, -4.618)
+
+if config.Mode ~= "full" and config.Mode ~= "single_layer" and config.Mode ~= "vertical" then
+    config.Mode = "vertical"
+end
+
+config.MinX = math.clamp(config.MinX, 0, 32)
+config.MaxX = math.clamp(config.MaxX, config.MinX, 32)
+config.MinY = math.clamp(config.MinY, 0, 681)
+config.MaxY = math.clamp(config.MaxY, config.MinY, 681)
+config.MinZ = math.clamp(config.MinZ, 0, 32)
+config.MaxZ = math.clamp(config.MaxZ, config.MinZ, 32)
+config.VerticalX = math.clamp(config.VerticalX, config.MinX, config.MaxX)
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local state = {
+    x = config.MinX,
+    y = config.MaxY,
+    z = config.MinZ,
+
+    running = false,
+    pausedUntil = 0,
+
+    fireCount = 0,
+    errorCount = 0,
+    skipCount = 0,
+    resetCount = 0,
+
+    status = "Starting",
+    lastResult = "-",
+    lastError = "-",
+
+    quarry = nil,
+    remote = nil,
+    remoteType = nil,
+    lastLookup = 0,
+
+    timerSeconds = nil,
+    timerText = "-",
+    timerAvailable = false,
+
+    timerObject = nil,
+    timerConnection = nil,
+    lastObservedSeconds = nil,
+    lastResetDetection = 0,
+    resetSerial = 0,
+    resetPending = false,
+    resetPendingSince = 0,
+    lastCountdownObject = nil,
+
+    workerSerial = 0,
+}
+
+-- ============================================================
+-- BASIC HELPERS
+-- ============================================================
+local function now()
+    return os.clock()
+end
+
+local function setStatus(text)
+    state.status = tostring(text)
+end
+
+local function resetCursor(reason)
+    if config.Mode == "vertical" then
+        state.x = config.VerticalX
+        state.y = config.MaxY
+        state.z = config.MinZ
+    else
+        state.x = config.MinX
+        state.y = config.MaxY
+        state.z = config.MinZ
+    end
+
+    state.lastResult = "cursor reset"
+    state.resetSerial += 1
+    setStatus("Cursor reset: " .. tostring(reason or "manual"))
+end
+
+local function clearReferences()
+    state.quarry = nil
+    state.remote = nil
+    state.remoteType = nil
+    state.lastLookup = 0
+end
+
+local function teleportToResetPoint()
+    if not config.TeleportOnGameReset then
+        return false, "teleport disabled"
+    end
+
+    -- The quarry can take roughly 1-2 seconds to rebuild. This function is
+    -- intentionally called only after the reset pause, then verifies the
+    -- character position and retries instead of assuming one PivotTo worked.
+    local deadline = now() + 8
+    local lastReason = "character unavailable"
+
+    while now() < deadline do
+        local character = player.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+
+        if character and character.Parent and root then
+            local destination = CFrame.new(
+                config.ResetTeleportPosition + Vector3.new(0, config.ResetTeleportLift, 0)
+            )
+
+            for attempt = 1, config.ResetTeleportRetries do
+                if not character.Parent or not root.Parent then
+                    break
+                end
+
+                local ok, err = pcall(function()
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                    character:PivotTo(destination)
+                end)
+
+                if ok then
+                    task.wait(0.08)
+                    local currentRoot = character:FindFirstChild("HumanoidRootPart")
+                    if currentRoot then
+                        local distance = (currentRoot.Position - destination.Position).Magnitude
+                        if distance <= 8 then
+                            currentRoot.AssemblyLinearVelocity = Vector3.zero
+                            currentRoot.AssemblyAngularVelocity = Vector3.zero
+                            return true, "teleported and verified (attempt " .. tostring(attempt) .. ")"
+                        end
+                        lastReason = "verification distance " .. string.format("%.1f", distance)
+                    end
+                else
+                    lastReason = tostring(err or "PivotTo failed")
+                end
+
+                task.wait(config.ResetTeleportRetryDelay)
+            end
+        end
+
+        task.wait(0.2)
+    end
+
+    return false, "teleport verification failed: " .. lastReason
+end
+
+-- ============================================================
+-- GAME OBJECT LOOKUP
+-- ============================================================
+local function findQuarry()
+    local rogueIslands = workspace:FindFirstChild("RogueIslands")
+    if not rogueIslands then
+        return nil, "RogueIslands missing"
+    end
+
+    local stoneQuarry = rogueIslands:FindFirstChild("StoneQuarry")
+    if not stoneQuarry then
+        return nil, "StoneQuarry missing"
+    end
+
+    local quarry = stoneQuarry:FindFirstChild("Quarry")
+    if not quarry then
+        return nil, "Quarry missing"
+    end
+
+    return quarry, "ok"
+end
+
+local function findMineRemote()
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    if not remotes then
+        return nil, nil, "Remotes missing"
+    end
+
+    local remote = remotes:FindFirstChild("MineStartQuarry")
+    if not remote then
+        return nil, nil, "MineStartQuarry missing"
+    end
+
+    if remote:IsA("RemoteFunction") then
+        return remote, "function", "ok"
+    elseif remote:IsA("RemoteEvent") then
+        return remote, "event", "ok"
+    end
+
+    return remote, "unknown", "remote has unsupported class: " .. remote.ClassName
+end
+
+local function refreshReferences(force)
+    if not force then
+        if state.quarry and state.quarry.Parent and state.remote and state.remote.Parent then
+            if now() - state.lastLookup < 1 then
+                return true
+            end
+        end
+    end
+
+    local quarry, quarryMsg = findQuarry()
+    if not quarry then
+        clearReferences()
+        state.lastLookup = now()
+        return false, quarryMsg
+    end
+
+    local remote, remoteType, remoteMsg = findMineRemote()
+    if not remote then
+        clearReferences()
+        state.lastLookup = now()
+        return false, remoteMsg
+    end
+
+    state.quarry = quarry
+    state.remote = remote
+    state.remoteType = remoteType
+    state.lastLookup = now()
+    return true, quarryMsg .. "; " .. remoteMsg
+end
+
+-- ============================================================
+-- QUARRY TIMER
+-- ============================================================
+local function parseCountdown(text)
+    text = tostring(text or "")
+
+    -- The supplied game UI example is: "Resets in 6:40".
+    local minutes, seconds = text:match("(%d+)%s*:%s*(%d+)")
+    if not minutes or not seconds then
+        return nil
+    end
+
+    minutes = tonumber(minutes)
+    seconds = tonumber(seconds)
+    if not minutes or not seconds or seconds > 59 then
+        return nil
+    end
+
+    return minutes * 60 + seconds
+end
+
+local function findCountdownObject()
+    local playerGui = player:FindFirstChild("PlayerGui")
+    if not playerGui then
+        return nil
+    end
+
+    local timerGui = playerGui:FindFirstChild("QuarryTimerGui")
+    if not timerGui then
+        return nil
+    end
+
+    local quarryTimer = timerGui:FindFirstChild("QuarryTimer")
+    if not quarryTimer then
+        return nil
+    end
+
+    return quarryTimer:FindFirstChild("Countdown")
+end
+
+local function beginMiningAfterReset(reason)
+    -- Fully stop mining while the quarry is rebuilding. Do not let a stale
+    -- InvokeServer call or old coordinate run during the regeneration window.
+    state.pausedUntil = math.huge
+    state.resetPending = false
+    state.resetPendingSince = 0
+
+    resetCursor(reason)
+    clearReferences()
+    setStatus("RESET CONFIRMED -> waiting " .. string.format("%.2f", config.ResetPause) .. "s for rebuild")
+
+    task.spawn(function()
+        task.wait(config.ResetPause)
+
+        -- Force a fresh lookup after regeneration instead of using stale
+        -- quarry/remote instances from the previous mining cycle.
+        refreshReferences(true)
+
+        if config.TeleportOnGameReset then
+            local ok, msg = teleportToResetPoint()
+            if ok then
+                setStatus("RESET CONFIRMED -> first coordinate -> " .. msg)
+            else
+                setStatus("RESET CONFIRMED -> first coordinate -> " .. msg)
+            end
+        else
+            setStatus("RESET CONFIRMED -> first coordinate")
+        end
+
+        -- Give the character one additional physics frame after the verified
+        -- teleport before allowing the mining worker to issue a request.
+        task.wait(0.15)
+        state.pausedUntil = now() + 0.15
+    end)
+end
+
+local function markResetPending(reason)
+    if state.resetPending then
+        return
+    end
+
+    state.resetPending = true
+    state.resetPendingSince = now()
+    state.pausedUntil = now() + config.ResetPause
+    setStatus("Reset pending: " .. tostring(reason or "countdown end"))
+end
+
+local function confirmPendingReset(reason)
+    if not state.resetPending then
+        return false
+    end
+
+    if now() - state.lastResetDetection < 1 then
+        return false
+    end
+
+    state.lastResetDetection = now()
+    state.resetCount += 1
+    beginMiningAfterReset(reason)
+    return true
+end
+
+local function detectTimerReset(seconds)
+    local previous = state.lastObservedSeconds
+    state.lastObservedSeconds = seconds
+
+    if previous == nil then
+        return
+    end
+
+    -- Treat the end of the countdown as a reset boundary. This is more
+    -- reliable than requiring the UI to visibly jump from 0:00 to 6:40.
+    if seconds <= 1 then
+        markResetPending("countdown reached " .. tostring(seconds) .. "s")
+        return
+    end
+
+    -- Confirm if the timer starts again after reaching the end.
+    if state.resetPending and seconds >= 5 then
+        confirmPendingReset("countdown restarted")
+        return
+    end
+
+    -- Also handle a direct upward jump when the UI skips 0:00.
+    if previous >= 0 and seconds > previous + 5 then
+        if now() - state.lastResetDetection >= 1 then
+            state.lastResetDetection = now()
+            state.resetCount += 1
+            beginMiningAfterReset("countdown jumped upward")
+        end
+    end
+end
+
+local function bindCountdown(obj)
+    if state.timerObject == obj then
+        return
+    end
+
+    if state.timerConnection then
+        pcall(function()
+            state.timerConnection:Disconnect()
+        end)
+        state.timerConnection = nil
+    end
+
+    state.timerObject = obj
+    state.lastCountdownObject = obj
+
+    if not obj then
+        state.timerAvailable = false
+        return
+    end
+
+    state.timerAvailable = true
+
+    state.timerConnection = obj:GetPropertyChangedSignal("Text"):Connect(function()
+        local text = tostring(obj.Text or "")
+        local seconds = parseCountdown(text)
+        state.timerText = text
+        if seconds ~= nil then
+            state.timerSeconds = seconds
+            detectTimerReset(seconds)
+        end
+    end)
+
+    local text = tostring(obj.Text or "")
+    local seconds = parseCountdown(text)
+    state.timerText = text
+    state.timerSeconds = seconds
+
+    -- Do not blindly call this a reset when the UI object is first found.
+    -- If it is recreated while a reset is pending, however, the new object
+    -- is strong evidence that the timer has restarted.
+    if seconds ~= nil then
+        if state.resetPending and seconds >= 5 then
+            confirmPendingReset("countdown object recreated")
+        else
+            state.lastObservedSeconds = seconds
+        end
+    end
+end
+
+-- Polling is retained because the game may destroy/recreate the timer GUI.
+task.spawn(function()
+    while true do
+        task.wait(0.10)
+
+        if not config.ResetDetectionEnabled then
+            continue
+        end
+
+        local countdown = findCountdownObject()
+        if countdown ~= state.timerObject then
+            bindCountdown(countdown)
+        end
+
+        if not countdown then
+            state.timerAvailable = false
+            -- If the countdown disappears immediately after reaching 0,
+            -- consider that the reset boundary and confirm it once.
+            if state.resetPending and now() - state.resetPendingSince >= 0.5 then
+                confirmPendingReset("countdown UI disappeared after zero")
+            end
+            continue
+        end
+
+        local text = tostring(countdown.Text or "")
+        local seconds = parseCountdown(text)
+        state.timerText = text
+
+        if seconds ~= nil then
+            state.timerAvailable = true
+            state.timerSeconds = seconds
+            detectTimerReset(seconds)
+        end
+    end
+end)
+
+-- ============================================================
+-- CURSOR ADVANCEMENT
+-- ============================================================
+local function advanceCursor()
+    if config.Mode == "vertical" then
+        state.z += 1
+        if state.z > config.MaxZ then
+            state.z = config.MinZ
+            state.y -= 1
+        end
+
+        if state.y < config.MinY then
+            -- Completing a full vertical column does NOT pretend the game reset.
+            -- We simply restart the configured column and continue.
+            state.x = config.VerticalX
+            state.y = config.MaxY
+            state.z = config.MinZ
+            setStatus("Vertical sweep completed -> restarted column")
+        end
+
+        return
+    end
+
+    state.z += 1
+    if state.z > config.MaxZ then
+        state.z = config.MinZ
+        state.x += 1
+    end
+
+    if state.x > config.MaxX then
+        state.x = config.MinX
+
+        if config.Mode == "single_layer" then
+            state.y = config.MaxY
+            setStatus("Layer completed -> restarted top layer")
+        else
+            state.y -= 1
+            if state.y < config.MinY then
+                state.y = config.MaxY
+                setStatus("Full sweep completed -> restarted top layer")
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- ONE REMOTE CALL
+-- ============================================================
+local function callMine(quarry, remote, remoteType, x, y, z)
+    local normal = Vector3.new(0, 1, 0)
+
+    if remoteType == "function" then
+        local invokeOk, result = pcall(function()
+            return remote:InvokeServer(quarry, x, y, z, normal)
+        end)
+
+        if not invokeOk then
+            return false, "InvokeServer error: " .. tostring(result)
+        end
+
+        -- A server-side false is treated as a rejected request and the cursor
+        -- stays on the same coordinate for a retry.
+        if result == false then
+            return false, "server returned false"
+        end
+
+        return true, "InvokeServer ok"
+    elseif remoteType == "event" then
+        local fireOk, err = pcall(function()
+            remote:FireServer(quarry, x, y, z, normal)
+        end)
+
+        if not fireOk then
+            return false, "FireServer error: " .. tostring(err)
+        end
+
+        return true, "FireServer ok"
+    end
+
+    return false, "Unsupported remote type"
+end
+
+local function mineOne()
+    if not config.Enabled then
+        setStatus("Disabled")
+        return false
+    end
+
+    if now() < state.pausedUntil then
+        return false
+    end
+
+    local ok, lookupMsg = refreshReferences(false)
+    if not ok then
+        setStatus("Waiting: " .. tostring(lookupMsg))
+        return false
+    end
+
+    local x, y, z = state.x, state.y, state.z
+    local quarry = state.quarry
+    local remote = state.remote
+    local remoteType = state.remoteType
+
+    if not quarry or not quarry.Parent or not remote or not remote.Parent then
+        clearReferences()
+        setStatus("References disappeared; refreshing")
+        return false
+    end
+
+    state.running = true
+
+    local success, message = callMine(quarry, remote, remoteType, x, y, z)
+
+    if success then
+        state.fireCount += 1
+        state.errorCount = 0
+        state.lastResult = string.format("OK X:%d Y:%d Z:%d", x, y, z)
+        state.lastError = "-"
+
+        -- Only advance after the request itself was accepted locally.
+        advanceCursor()
+        return true
+    end
+
+    state.errorCount += 1
+    state.lastError = message
+    state.lastResult = string.format("FAIL X:%d Y:%d Z:%d", x, y, z)
+    setStatus(message)
+
+    -- Force fresh references after repeated failures.
+    if state.errorCount >= 2 then
+        clearReferences()
+        state.errorCount = 0
+        state.pausedUntil = now() + 0.15
+        setStatus("Mine rejected; references refreshed")
+    end
+
+    return false
+end
+
+-- ============================================================
+-- MINER WORKER
+-- ============================================================
+local workerRunning = true
+
+task.spawn(function()
+    while workerRunning do
+        if config.Enabled then
+            local batch = math.max(1, math.floor(config.BatchSize or 1))
+            for _ = 1, batch do
+                if not config.Enabled or now() < state.pausedUntil then
+                    break
+                end
+                pcall(mineOne)
+            end
+        else
+            state.running = false
+        end
+
+        task.wait(config.MineInterval)
+    end
+end)
+
+-- ============================================================
+-- UI
+-- ============================================================
+local COLORS = {
+    bg = Color3.fromRGB(13, 14, 19),
+    panel = Color3.fromRGB(19, 21, 28),
+    panel2 = Color3.fromRGB(25, 28, 37),
+    border = Color3.fromRGB(55, 59, 72),
+    text = Color3.fromRGB(238, 240, 247),
+    muted = Color3.fromRGB(145, 150, 165),
+    accent = Color3.fromRGB(200, 160, 90),
+    good = Color3.fromRGB(91, 214, 142),
+    bad = Color3.fromRGB(235, 102, 111),
+}
+
+local function corner(object, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 8)
+    c.Parent = object
+end
+
+local function stroke(object, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = COLORS.border
+    s.Thickness = 1
+    s.Transparency = transparency or 0
+    s.Parent = object
+end
+
+local function label(parent, text, size, color, font)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.TextColor3 = color or COLORS.text
+    l.Font = font or Enum.Font.Gotham
+    l.TextSize = size or 12
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Parent = parent
+    return l
+end
+
+local function button(parent, text)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, 0, 0, 36)
+    b.BackgroundColor3 = COLORS.panel2
+    b.BorderSizePixel = 0
+    b.Text = text
+    b.TextColor3 = COLORS.text
+    b.Font = Enum.Font.GothamSemibold
+    b.TextSize = 11
+    b.AutoButtonColor = false
+    b.Parent = parent
+    corner(b, 8)
+    stroke(b, 0.35)
+
+    b.MouseEnter:Connect(function()
+        pcall(function()
+            TweenService:Create(b, TweenInfo.new(0.12), {
+                BackgroundColor3 = COLORS.panel,
+            }):Play()
+        end)
+    end)
+
+    b.MouseLeave:Connect(function()
+        pcall(function()
+            TweenService:Create(b, TweenInfo.new(0.12), {
+                BackgroundColor3 = COLORS.panel2,
+            }):Play()
+        end)
+    end)
+
+    return b
+end
+
+local function makeUI()
+    local old = UI_PARENT:FindFirstChild("QuarryMinerV3")
+    if old then
+        old:Destroy()
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "QuarryMinerV3"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = UI_PARENT
+
+    local main = Instance.new("Frame")
+    main.Size = UDim2.new(0, 430, 0, 560)
+    main.Position = UDim2.new(0.5, -215, 0.5, -280)
+    main.BackgroundColor3 = COLORS.bg
+    main.BorderSizePixel = 0
+    main.Active = true
+    main.Draggable = true
+    main.Parent = gui
+    corner(main, 14)
+    stroke(main, 0.1)
+
+    local header = Instance.new("Frame")
+    header.Size = UDim2.new(1, 0, 0, 60)
+    header.BackgroundColor3 = COLORS.panel
+    header.BorderSizePixel = 0
+    header.Parent = main
+    corner(header, 14)
+
+    local title = label(header, "Quarry Miner", 18, COLORS.text, Enum.Font.GothamBold)
+    title.Position = UDim2.new(0, 18, 0, 9)
+    title.Size = UDim2.new(0, 230, 0, 22)
+
+    local subtitle = label(header, "Reset-aware sequential remote miner", 9, COLORS.muted)
+    subtitle.Position = UDim2.new(0, 18, 0, 33)
+    subtitle.Size = UDim2.new(0, 260, 0, 16)
+
+    local close = button(header, "×")
+    close.Size = UDim2.new(0, 34, 0, 34)
+    close.Position = UDim2.new(1, -48, 0, 13)
+    close.MouseButton1Click:Connect(function()
+        gui:Destroy()
+    end)
+
+    local content = Instance.new("ScrollingFrame")
+    content.Size = UDim2.new(1, -24, 1, -72)
+    content.Position = UDim2.new(0, 12, 0, 66)
+    content.BackgroundTransparency = 1
+    content.BorderSizePixel = 0
+    content.ScrollBarThickness = 4
+    content.CanvasSize = UDim2.new()
+    content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    content.Parent = main
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 2)
+    padding.PaddingBottom = UDim.new(0, 10)
+    padding.PaddingLeft = UDim.new(0, 2)
+    padding.PaddingRight = UDim.new(0, 6)
+    padding.Parent = content
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 7)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = content
+
+    local function section(text, order)
+        local s = label(content, text, 9, COLORS.accent, Enum.Font.GothamBold)
+        s.Size = UDim2.new(1, 0, 0, 18)
+        s.LayoutOrder = order
+        return s
+    end
+
+    local function row(text, value, order)
+        local holder = Instance.new("Frame")
+        holder.Size = UDim2.new(1, 0, 0, 38)
+        holder.BackgroundColor3 = COLORS.panel
+        holder.BorderSizePixel = 0
+        holder.LayoutOrder = order
+        holder.Parent = content
+        corner(holder, 8)
+        stroke(holder, 0.55)
+
+        local nameLabel = label(holder, text, 10, COLORS.text, Enum.Font.GothamSemibold)
+        nameLabel.Position = UDim2.new(0, 12, 0, 0)
+        nameLabel.Size = UDim2.new(0.55, 0, 1, 0)
+
+        local valueLabel = label(holder, value, 10, COLORS.good, Enum.Font.Code)
+        valueLabel.Position = UDim2.new(0.55, 0, 0, 0)
+        valueLabel.Size = UDim2.new(0.43, -12, 1, 0)
+        valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+
+        return valueLabel
+    end
+
+    local toggleMining = button(content, "")
+    toggleMining.LayoutOrder = 2
+
+    local modeButton = button(content, "Mode")
+    modeButton.LayoutOrder = 3
+
+    local resetDetection = button(content, "")
+    resetDetection.LayoutOrder = 4
+
+    local teleportReset = button(content, "")
+    teleportReset.LayoutOrder = 5
+
+    local resetCursorButton = button(content, "Reset Cursor to First Coordinate")
+    resetCursorButton.LayoutOrder = 6
+
+    local testMineButton = button(content, "Fire One Test Request")
+    testMineButton.LayoutOrder = 7
+
+    section("LIVE", 10)
+    local posLabel = row("Position", "-", 11)
+    local timerLabel = row("Quarry timer", "-", 12)
+    local timerStateLabel = row("Timer state", "-", 13)
+    local remoteLabel = row("Remote", "-", 14)
+    local statusLabel = row("Status", "-", 15)
+    local resultLabel = row("Last request", "-", 16)
+    local countersLabel = row("Counters", "-", 17)
+
+    section("SETTINGS", 20)
+    local intervalButton = button(content, "Mine interval: " .. tostring(config.MineInterval))
+    intervalButton.LayoutOrder = 21
+
+    local verticalXButton = button(content, "Vertical X: " .. tostring(config.VerticalX))
+    verticalXButton.LayoutOrder = 22
+
+    -- ---------- controls ----------
+    local function refreshControls()
+        toggleMining.Text = config.Enabled and "Mining: ON" or "Mining: OFF"
+        toggleMining.TextColor3 = config.Enabled and COLORS.good or COLORS.bad
+
+        modeButton.Text = "Mode: " .. tostring(config.Mode)
+        resetDetection.Text = config.ResetDetectionEnabled
+            and "Game reset detection: ON"
+            or "Game reset detection: OFF"
+        resetDetection.TextColor3 = config.ResetDetectionEnabled and COLORS.good or COLORS.bad
+
+        teleportReset.Text = config.TeleportOnGameReset
+            and "Teleport on actual reset: ON"
+            or "Teleport on actual reset: OFF"
+        teleportReset.TextColor3 = config.TeleportOnGameReset and COLORS.good or COLORS.bad
+
+        intervalButton.Text = string.format("Mine interval: %.2fs", config.MineInterval)
+        verticalXButton.Text = "Vertical X: " .. tostring(config.VerticalX)
+    end
+
+    toggleMining.MouseButton1Click:Connect(function()
+        config.Enabled = not config.Enabled
+        state.running = false
+        setStatus(config.Enabled and "Enabled" or "Disabled")
+        saveConfig()
+        refreshControls()
+    end)
+
+    modeButton.MouseButton1Click:Connect(function()
+        if config.Mode == "full" then
+            config.Mode = "single_layer"
+        elseif config.Mode == "single_layer" then
+            config.Mode = "vertical"
+        else
+            config.Mode = "full"
+        end
+
+        resetCursor("mode changed")
+        saveConfig()
+        refreshControls()
+    end)
+
+    resetDetection.MouseButton1Click:Connect(function()
+        config.ResetDetectionEnabled = not config.ResetDetectionEnabled
+        saveConfig()
+        refreshControls()
+    end)
+
+    teleportReset.MouseButton1Click:Connect(function()
+        config.TeleportOnGameReset = not config.TeleportOnGameReset
+        saveConfig()
+        refreshControls()
+    end)
+
+    resetCursorButton.MouseButton1Click:Connect(function()
+        state.pausedUntil = now() + 0.2
+        clearReferences()
+        resetCursor("manual button")
+    end)
+
+    testMineButton.MouseButton1Click:Connect(function()
+        state.pausedUntil = 0
+        local ok = pcall(mineOne)
+        if not ok then
+            setStatus("Test request raised an unexpected error")
+        end
+    end)
+
+    intervalButton.MouseButton1Click:Connect(function()
+        local values = {0.05, 0.09, 0.12, 0.20, 0.35}
+        local current = config.MineInterval
+        local nextValue = values[1]
+        for i, value in ipairs(values) do
+            if math.abs(value - current) < 0.001 then
+                nextValue = values[(i % #values) + 1]
+                break
+            end
+        end
+        config.MineInterval = nextValue
+        saveConfig()
+        refreshControls()
+    end)
+
+    verticalXButton.MouseButton1Click:Connect(function()
+        local nextX = config.VerticalX + 1
+        if nextX > config.MaxX then
+            nextX = config.MinX
+        end
+        config.VerticalX = nextX
+        saveConfig()
+        resetCursor("vertical X changed")
+        refreshControls()
+    end)
+
+    refreshControls()
+
+    -- ---------- live display ----------
+    task.spawn(function()
+        while gui.Parent do
+            local pauseLeft = math.max(0, state.pausedUntil - now())
+            local timerSeconds = state.timerSeconds
+
+            posLabel.Text = string.format("X:%d  Y:%d  Z:%d", state.x, state.y, state.z)
+
+            if timerSeconds ~= nil then
+                local mins = math.floor(timerSeconds / 60)
+                local secs = timerSeconds % 60
+                timerLabel.Text = string.format("%d:%02d", mins, secs)
+            else
+                timerLabel.Text = state.timerText ~= "" and state.timerText or "unavailable"
+            end
+
+            timerStateLabel.Text = state.timerAvailable
+                and "FOUND / monitoring"
+                or "NOT FOUND"
+            timerStateLabel.TextColor3 = state.timerAvailable and COLORS.good or COLORS.bad
+
+            remoteLabel.Text = state.remote
+                and tostring(state.remoteType) .. " / " .. tostring(state.remote.Name)
+                or "not found"
+
+            statusLabel.Text = pauseLeft > 0
+                and string.format("%s (paused %.1fs)", state.status, pauseLeft)
+                or tostring(state.status)
+
+            resultLabel.Text = tostring(state.lastResult)
+            countersLabel.Text = string.format(
+                "fires:%d  errors:%d  resets:%d",
+                state.fireCount,
+                state.errorCount,
+                state.resetCount
+            )
+
+            task.wait(0.25)
+        end
+    end)
+end
+
+-- ============================================================
+-- START
+-- ============================================================
+resetCursor("startup")
+setStatus("Waiting for quarry + remote")
+makeUI()
+saveConfig()
+
+-- Keep these services referenced so executor environments do not optimize away
+-- the event-driven UI/imports in odd compatibility layers.
+RunService.Heartbeat:Connect(function()
+    state.running = config.Enabled and now() >= state.pausedUntil
+end)
+
