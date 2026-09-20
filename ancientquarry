@@ -1,12 +1,11 @@
 --[[
-    Ancient Quarry Miner v2
+    Ancient Quarry Miner v3
     - Quarry path: workspace.RogueIslands.AncientQuarry.Quarry
     - Remote:      ReplicatedStorage.Remotes.MineStartQuarry
     - Call:        remote:InvokeServer(quarry, x, y, z, Vector3.new(0, 1, 0))
     - Reset detection via PlayerGui.QuarryTimerGui.QuarryTimer.Countdown
     - Reset teleport target: 3560.037, 4911.869, 1.613
-      (can also be overridden via _G.__AncientQuarryResetPos,
-      getgenv().__AncientQuarryResetPos, or shared.__AncientQuarryResetPos)
+      treated as the HumanoidRootPart position (root.CFrame).
     - Modes: full / single_layer / vertical
 --]]
 
@@ -33,7 +32,7 @@ local UI_PARENT = getUIParent()
 -- ============================================================
 -- CONFIG
 -- ============================================================
-local CONFIG_FILE = "ancient_quarry_miner_v2.cfg"
+local CONFIG_FILE = "ancient_quarry_miner_v3.cfg"
 
 local DEFAULT_RESET_POS = Vector3.new(3560.037, 4911.869, 1.613)
 
@@ -79,9 +78,9 @@ local config = {
 
     ResetDetectionEnabled = true,
     ResetPause = 2.25,
-    ResetTeleportLift = 0,
-    ResetTeleportRetries = 4,
-    ResetTeleportRetryDelay = 0.35,
+    ResetTeleportLift = 3,
+    ResetTeleportRetries = 6,
+    ResetTeleportRetryDelay = 0.25,
     TeleportOnGameReset = true,
     ResetTeleportPosition = resolveResetPos(),
 }
@@ -141,7 +140,7 @@ end
 
 loadConfig()
 
--- The loader / default always wins over the saved config. Persist it.
+-- The loader / default always wins over the saved config.
 do
     local override = resolveResetPos()
     if typeof(override) == "Vector3" then
@@ -160,9 +159,9 @@ config.MinZ = math.floor(tonumber(config.MinZ) or 0)
 config.MaxZ = math.floor(tonumber(config.MaxZ) or 32)
 config.VerticalX = math.floor(tonumber(config.VerticalX) or 1)
 config.ResetPause = math.clamp(tonumber(config.ResetPause) or 2.25, 0.25, 10)
-config.ResetTeleportLift = math.clamp(tonumber(config.ResetTeleportLift) or 0, 0, 20)
-config.ResetTeleportRetries = math.clamp(math.floor(tonumber(config.ResetTeleportRetries) or 4), 1, 8)
-config.ResetTeleportRetryDelay = math.clamp(tonumber(config.ResetTeleportRetryDelay) or 0.35, 0.1, 2)
+config.ResetTeleportLift = math.clamp(tonumber(config.ResetTeleportLift) or 3, 0, 20)
+config.ResetTeleportRetries = math.clamp(math.floor(tonumber(config.ResetTeleportRetries) or 6), 1, 10)
+config.ResetTeleportRetryDelay = math.clamp(tonumber(config.ResetTeleportRetryDelay) or 0.25, 0.1, 2)
 
 if typeof(config.ResetTeleportPosition) ~= "Vector3" then
     config.ResetTeleportPosition = DEFAULT_RESET_POS
@@ -239,24 +238,28 @@ local function resetCursor(reason)
 end
 
 -- ============================================================
--- CHARACTER TELEPORT
+-- CHARACTER TELEPORT (root-based, physics-step verified)
 -- ============================================================
 local function teleportToResetPoint()
     if not config.TeleportOnGameReset then
         return false, "teleport disabled"
     end
 
-    local deadline = now() + 8
+    local target = config.ResetTeleportPosition
+    if typeof(target) ~= "Vector3" then
+        return false, "invalid teleport position"
+    end
+
+    local deadline = now() + 10
     local lastReason = "character unavailable"
 
     while now() < deadline do
         local character = player.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
         local root = character and character:FindFirstChild("HumanoidRootPart")
 
-        if character and character.Parent and root then
-            local destination = CFrame.new(
-                config.ResetTeleportPosition + Vector3.new(0, config.ResetTeleportLift, 0)
-            )
+        if character and character.Parent and humanoid and root and root.Parent then
+            local destination = target + Vector3.new(0, config.ResetTeleportLift, 0)
 
             for attempt = 1, config.ResetTeleportRetries do
                 if not character.Parent or not root.Parent then break end
@@ -264,23 +267,50 @@ local function teleportToResetPoint()
                 local ok, err = pcall(function()
                     root.AssemblyLinearVelocity = Vector3.zero
                     root.AssemblyAngularVelocity = Vector3.zero
-                    character:PivotTo(destination)
+                    root.CFrame = CFrame.new(destination)
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
                 end)
 
-                if ok then
-                    task.wait(0.08)
-                    local currentRoot = character:FindFirstChild("HumanoidRootPart")
-                    if currentRoot then
-                        local distance = (currentRoot.Position - destination.Position).Magnitude
-                        if distance <= 8 then
-                            currentRoot.AssemblyLinearVelocity = Vector3.zero
-                            currentRoot.AssemblyAngularVelocity = Vector3.zero
-                            return true, "teleported and verified (attempt " .. tostring(attempt) .. ")"
+                if not ok then
+                    lastReason = tostring(err or "root teleport failed")
+                    task.wait(config.ResetTeleportRetryDelay)
+                    continue
+                end
+
+                RunService.Heartbeat:Wait()
+
+                local newRoot = character:FindFirstChild("HumanoidRootPart")
+
+                if newRoot and newRoot.Parent then
+                    local distance = (newRoot.Position - destination).Magnitude
+
+                    if distance <= 3 then
+                        newRoot.AssemblyLinearVelocity = Vector3.zero
+                        newRoot.AssemblyAngularVelocity = Vector3.zero
+
+                        RunService.Heartbeat:Wait()
+
+                        local verifyRoot = character:FindFirstChild("HumanoidRootPart")
+
+                        if verifyRoot then
+                            local verifyDistance = (verifyRoot.Position - destination).Magnitude
+
+                            if verifyDistance <= 5 then
+                                return true,
+                                    "root teleported and verified (attempt "
+                                    .. tostring(attempt) .. ")"
+                            end
+
+                            lastReason = "moved after verification: "
+                                .. string.format("%.1f", verifyDistance)
                         end
-                        lastReason = "verification distance " .. string.format("%.1f", distance)
+                    else
+                        lastReason = "wrong position: "
+                            .. string.format("%.1f", distance)
                     end
                 else
-                    lastReason = tostring(err or "PivotTo failed")
+                    lastReason = "HumanoidRootPart disappeared"
                 end
 
                 task.wait(config.ResetTeleportRetryDelay)
@@ -290,7 +320,7 @@ local function teleportToResetPoint()
         task.wait(0.2)
     end
 
-    return false, "teleport verification failed: " .. lastReason
+    return false, "teleport failed: " .. lastReason
 end
 
 -- ============================================================
